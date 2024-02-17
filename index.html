@@ -1,0 +1,399 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <meta name="generator" content="Pelican" />
+        <title>Blog</title>
+        <link rel="stylesheet" href="/theme/css/main.css" />
+</head>
+
+<body id="index" class="home">
+        <header id="banner" class="body">
+                <h1><a href="/">Blog</a></h1>
+                <nav><ul>
+                    <li><a href="/category/articles.html">articles</a></li>
+                    <li><a href="/category/misc.html">misc</a></li>
+                </ul></nav>
+        </header><!-- /#banner -->
+
+            <aside id="featured" class="body">
+                <article>
+                    <h1 class="entry-title"><a href="/bankconflictscuda.html">"BankConflictsCuda"</a></h1>
+<footer class="post-info">
+        <abbr class="published" title="2024-02-16T00:00:00+01:00">
+                Published: Fr 16 Februar 2024
+        </abbr>
+
+        <address class="vcard author">
+                By                         <a class="url fn" href="/author/fabian-schuetze.html">Fabian Schuetze</a>
+        </address>
+<p>In <a href="/category/articles.html">articles</a>.</p>
+
+</footer><!-- /.post-info --><h1>Avoiding Memory Bank Conflicts in Cuda Programs</h1>
+<p>Global memory access latencies are very high (relative to computing latencies) and a common source of under-utilization of CPUs and GPUs. Accessing memory efficiently is particularly important for harnessing the power of vector processors, such as SIMD processors and GPUs. Memory banks have been used for a long time to hide access latency for vector processors. The first vector machine, the CRAY-1 computer, already had 16 memory banks. To hide memory latency, memory banks need to be accessed conflict-free. The CRAY-1 already <a href="https://dl.acm.org/doi/pdf/10.1145/359327.359336">instructed</a> its users how to avoid bank conflicts. Today, bank conflicts are of prime importance for CUDA kernels and can seriously impair the throughput of a GPU.</p>
+<p>As this post shows, taking good care of memory banks in shared memory can improve the speed of Cuda kernels by 50%. Despite its importance, shared memory bank access is not documented well in the CUDA programming guide. After introducing shared memory, the blog post presents several undocumented bank-free access patterns. The final section of the blog post shows that recent additions to the CUDA programming model (requiring compute capability 8.0 and above) help avoid many bank conflicts. Older suggestions to use memory padding are instead shown to be sub-optimal.</p>
+<h2>The Importance of Shared Memory (L1 Cache)</h2>
+<p>Shared memory refers to the L1 cache of Streaming-Multiprocessors (which resemble a collection of SIMD processors). In contrast to CPUs, the L1 cache can be programmed and is not controlled entirely by the execution units on the hardware. Shared memory is much faster but much smaller than global memory. For the V100 architecture, the <a href="https://arxiv.org/abs/1804.06826">measured</a> size and bandwidth are:</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>Global Memory</th>
+<th>L1 Cache</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Size</td>
+<td>16GB</td>
+<td>96 KB</td>
+</tr>
+<tr>
+<td>Bandwidth</td>
+<td>750 GB/sec</td>
+<td>12,080 GB/sec</td>
+</tr>
+</tbody>
+</table>
+<p>The same qualitative differences hold for <a href="https://en.algorithmica.org/hpc/external-memory/hierarchy/">CPU</a>: Global memory (RAM) comes in all sizes, and shared memory is often 32 KB or 48 KB. RAM bandwidth is about 10GB/sec, while L1 bandwidth is 80GB/sec. However, it can be seen the relative L1 bandwidth is larger on the GPU than the CPU.</p>
+<p>Shared memory is partitioned into banks. Consecutive 32bit words belong to one bank, and there are 32 different memory banks, as described in the <a href="https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html?highlight=banks#shared-memory-and-memory-banks">Cuda Programming Guide</a>. As the size of the shared memory is much larger than the number of banks, different shared memory positions lie on the same bank. The threads in a warp can access different banks without any conflicts. If threads want to access memory from the same bank (but in different memory positions), their access is serialized. A serialized access means that the threads stall. A tabular representation of the banks can be seen below:</p>
+<table>
+<thead>
+<tr>
+<th>Byte Position</th>
+<th>0...3</th>
+<th>3...7</th>
+<th>...</th>
+<th>124...127</th>
+<th>128...131</th>
+<th>132...137</th>
+<th>...</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Memory Bank</td>
+<td>0</td>
+<td>1</td>
+<td>...</td>
+<td>31</td>
+<td>0</td>
+<td>1</td>
+<td></td>
+</tr>
+</tbody>
+</table>
+<p>To illustrate the memory bank conflicts in a simple example, consider the following two kernels:</p>
+<div class="highlight"><pre><span></span><code><span class="n">__global__</span><span class="w"> </span><span class="n">void</span><span class="w"> </span><span class="n">ConflictFreeAccess</span><span class="p">(</span><span class="nc">float</span><span class="o">*</span><span class="w"> </span><span class="nf">sum</span><span class="p">)</span><span class="w"> </span><span class="err">{</span>
+<span class="w">    </span><span class="n">constexpr</span><span class="w"> </span><span class="n">size_t</span><span class="w"> </span><span class="n">sz</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">32</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="mi">32</span><span class="p">;</span>
+<span class="w">    </span><span class="n">__shared__</span><span class="w"> </span><span class="nc">float</span><span class="w"> </span><span class="n">shmem</span><span class="o">[</span><span class="n">sz</span><span class="o">]</span><span class="p">;</span>
+<span class="w">    </span><span class="n">shmem</span><span class="o">[</span><span class="n">threadIdx.x</span><span class="o">]</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">threadIdx</span><span class="p">.</span><span class="n">x</span><span class="p">;</span>
+<span class="w">    </span><span class="o">[</span><span class="n">...CODE NOT SHOWN…</span><span class="o">]</span>
+<span class="err">}</span>
+
+<span class="n">__global__</span><span class="w"> </span><span class="n">void</span><span class="w"> </span><span class="n">ConflictAccess</span><span class="p">(</span><span class="nc">float</span><span class="o">*</span><span class="w"> </span><span class="nf">sum</span><span class="p">)</span><span class="w"> </span><span class="err">{</span>
+<span class="w">    </span><span class="n">__shared__</span><span class="w"> </span><span class="nc">float</span><span class="w"> </span><span class="n">shmem</span><span class="o">[</span><span class="n">32 * 32</span><span class="o">]</span><span class="p">;</span>
+<span class="w">    </span><span class="n">constexpr</span><span class="w"> </span><span class="n">size_t</span><span class="w"> </span><span class="n">sz</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">32</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="mi">32</span><span class="p">;</span>
+<span class="w">    </span><span class="n">shmem</span><span class="o">[</span><span class="n">threadIdx.x * 32</span><span class="o">]</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">threadIdx</span><span class="p">.</span><span class="n">x</span><span class="p">;</span>
+<span class="w">    </span><span class="o">[</span><span class="n">...CODE NOT SHOWN…</span><span class="o">]</span>
+<span class="err">}</span>
+</code></pre></div>
+
+<p>Both kernels allocate a shared buffer for 1024 floats. Threads in the  <code>ConflictFreeAccess</code> write their ID into successive memory positions (and successive banks). Instead, threads in the <code>ConflictAccess</code> write their IDs into the same bank. The hidden code prevents the compiler from optimizing the kernel away. Bank conflicts get identified by the Cuda Nsight profiler. The profiler shows that there is a 31-way conflict in the second kernel but no conflict in the first kernel:</p>
+<div class="highlight"><pre><span></span><code><span class="c">  ConflictFreeAccess(float *) (1</span><span class="nt">,</span><span class="c"> 1</span><span class="nt">,</span><span class="c"> 1)x(32</span><span class="nt">,</span><span class="c"> 1</span><span class="nt">,</span><span class="c"> 1)</span><span class="nt">,</span><span class="c"> Context 1</span><span class="nt">,</span><span class="c"> Stream 7</span><span class="nt">,</span><span class="c"> Device 0</span><span class="nt">,</span><span class="c"> CC 7</span><span class="nt">.</span><span class="c">5</span>
+<span class="c">    Section: Command line profiler metrics</span>
+<span class="c">    </span><span class="nb">--------------------------------------------------------</span><span class="c"> </span><span class="nb">-----------</span><span class="c"> </span><span class="nb">------------</span>
+<span class="c">    Metric Name                                             Metric Unit Metric Value</span>
+<span class="c">    </span><span class="nb">--------------------------------------------------------</span><span class="c"> </span><span class="nb">-----------</span><span class="c"> </span><span class="nb">------------</span>
+<span class="c">    l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_ld</span><span class="nt">.</span><span class="c">sum                        0</span>
+<span class="c">    l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_st</span><span class="nt">.</span><span class="c">sum                        0</span>
+<span class="c">    </span><span class="nb">--------------------------------------------------------</span><span class="c"> </span><span class="nb">-----------</span><span class="c"> </span><span class="nb">------------</span>
+
+<span class="c">  ConflictAccess(float *) (1</span><span class="nt">,</span><span class="c"> 1</span><span class="nt">,</span><span class="c"> 1)x(32</span><span class="nt">,</span><span class="c"> 1</span><span class="nt">,</span><span class="c"> 1)</span><span class="nt">,</span><span class="c"> Context 1</span><span class="nt">,</span><span class="c"> Stream 7</span><span class="nt">,</span><span class="c"> Device 0</span><span class="nt">,</span><span class="c"> CC 7</span><span class="nt">.</span><span class="c">5</span>
+<span class="c">    Section: Command line profiler metrics</span>
+<span class="c">    </span><span class="nb">--------------------------------------------------------</span><span class="c"> </span><span class="nb">-----------</span><span class="c"> </span><span class="nb">------------</span>
+<span class="c">    Metric Name                                             Metric Unit Metric Value</span>
+<span class="c">    </span><span class="nb">--------------------------------------------------------</span><span class="c"> </span><span class="nb">-----------</span><span class="c"> </span><span class="nb">------------</span>
+<span class="c">    l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_ld</span><span class="nt">.</span><span class="c">sum                        0</span>
+<span class="c">    l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_st</span><span class="nt">.</span><span class="c">sum                    31</span>
+<span class="c">    </span><span class="nb">--------------------------------------------------------</span><span class="c"> </span><span class="nb">-----------</span><span class="c"> </span><span class="nb">------------</span>
+</code></pre></div>
+
+<h2>Undocumented Features of Memory banks</h2>
+<p>Bank conflicts were originally described with floats and banks spanning four bytes (one float). However, highly performant GEMM kernels neither use floats nor load values individually. Most commonly, they use half floats and load, in SIMD style, packed 128-bit values. Both would incur a memory bank conflict. In tabular form, the two examples are:</p>
+<table>
+<thead>
+<tr>
+<th>Banks</th>
+<th>0</th>
+<th>1</th>
+<th>...</th>
+<th>15</th>
+<th>16</th>
+<th>..</th>
+<th>31</th>
+<th>0</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Load 16bit float</td>
+<td>0, 1</td>
+<td>2, 3</td>
+<td></td>
+<td>30, 31</td>
+<td>-</td>
+<td></td>
+<td>-</td>
+<td>-</td>
+</tr>
+<tr>
+<td>Vectorized, loat 8 16bit floats</td>
+<td>0</td>
+<td>0</td>
+<td></td>
+<td>3</td>
+<td>4</td>
+<td></td>
+<td>7</td>
+<td>8</td>
+</tr>
+</tbody>
+</table>
+<p>These two kernels (see <a href="https://stackoverflow.com/questions/77810812/why-is-there-no-shared-memory-bank-conflict-when-loading-consecutive-half-floats">here</a> for the complete implementation) can be profiled again with Nsight. Profiling shows that the two kernels do not incur any bank conflicts. Although this is great for performance (and does not force the programmer to trade off vectorized access with bank conflicts), this is not documented in the Cuda programming guide and makes kernels hard to reason about. Memory bank conflicts primarily need to be identified with a profiler. The following section highlights how crucial shared memory bank conflicts are in a high-performance GEMM implementation.</p>
+<h2>Addressing Memory Bank conflicts with Async Memory Access</h2>
+<p>As described, shared memory has very high throughput, and bank conflicts need to be identified empirically. Several avenues exist to circumvent bank conflicts. Some suggest [padding]((https://developer.nvidia.com/blog/using-shared-memory-cuda-cc/) of the memory buffer. However, I usually find async memory access the fastest and most reliable solution. The section below documents that avoiding bank conflicts increases the performance of a GEMM kernel by 50%, enabled by async memory accesses using modern <a href="https://docs.nvidia.com/cuda/parallel-thread-execution/index.html">PTX</a> intrinsics.  </p>
+<p>Consider the following GEMM kernel below. For simplicity, the kernel uses floats and does not use any Tensor core intrinsics.  </p>
+<div class="highlight"><pre><span></span><code><span class="n">template</span><span class="w"> </span><span class="o">&lt;</span><span class="n">typename</span><span class="w"> </span><span class="n">T</span><span class="p">,</span><span class="w"> </span><span class="n">typename</span><span class="w"> </span><span class="n">accum_type</span><span class="p">,</span><span class="w"> </span><span class="n">typename</span><span class="w"> </span><span class="n">tb</span><span class="p">,</span><span class="w"> </span><span class="n">typename</span><span class="w"> </span><span class="n">wb</span><span class="o">&gt;</span>
+<span class="n">__global__</span><span class="w"> </span><span class="nb nb-Type">void</span><span class="w"> </span><span class="n">GEMM</span><span class="p">(</span><span class="n">T</span><span class="w"> </span><span class="o">*</span><span class="n">__restrict__</span><span class="w"> </span><span class="n">A</span><span class="p">,</span><span class="w"> </span><span class="n">T</span><span class="w"> </span><span class="o">*</span><span class="n">__restrict__</span><span class="w"> </span><span class="n">B</span><span class="p">,</span><span class="w"> </span><span class="n">T</span><span class="w"> </span><span class="o">*</span><span class="n">__restrict__</span><span class="w"> </span><span class="n">C</span><span class="p">,</span>
+<span class="w">                     </span><span class="n">size_t</span><span class="w"> </span><span class="n">M</span><span class="p">,</span><span class="w"> </span><span class="n">size_t</span><span class="w"> </span><span class="n">N</span><span class="p">,</span><span class="w"> </span><span class="n">size_t</span><span class="w"> </span><span class="n">K</span><span class="p">,</span><span class="w"> </span><span class="n">accum_type</span><span class="w"> </span><span class="n">alpha</span><span class="p">,</span>
+<span class="w">                     </span><span class="n">accum_type</span><span class="w"> </span><span class="n">beta</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="nb">assert</span><span class="p">(</span><span class="n">M</span><span class="w"> </span><span class="o">%</span><span class="w"> </span><span class="n">tb</span><span class="p">::</span><span class="n">kM</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="mi">0</span><span class="p">);</span>
+<span class="w">    </span><span class="nb">assert</span><span class="p">(</span><span class="n">N</span><span class="w"> </span><span class="o">%</span><span class="w"> </span><span class="n">tb</span><span class="p">::</span><span class="n">kN</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="mi">0</span><span class="p">);</span>
+<span class="w">    </span><span class="nb">assert</span><span class="p">(</span><span class="n">K</span><span class="w"> </span><span class="o">%</span><span class="w"> </span><span class="n">tb</span><span class="p">::</span><span class="n">kK</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="mi">0</span><span class="p">);</span>
+
+<span class="w">    </span><span class="k">const</span><span class="w"> </span><span class="n">size_t</span><span class="w"> </span><span class="n">block_base_x</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">blockIdx</span><span class="o">.</span><span class="n">x</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">tb</span><span class="p">::</span><span class="n">kN</span><span class="p">;</span>
+<span class="w">    </span><span class="k">const</span><span class="w"> </span><span class="n">size_t</span><span class="w"> </span><span class="n">block_base_y</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">blockIdx</span><span class="o">.</span><span class="n">y</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">tb</span><span class="p">::</span><span class="n">kM</span><span class="p">;</span>
+
+<span class="w">    </span><span class="n">constexpr</span><span class="w"> </span><span class="n">size_t</span><span class="w"> </span><span class="n">skew</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">8</span><span class="p">;</span>
+<span class="w">    </span><span class="n">__shared__</span><span class="w"> </span><span class="n">T</span><span class="w"> </span><span class="n">As</span><span class="p">[</span><span class="n">tb</span><span class="p">::</span><span class="n">kM</span><span class="p">][</span><span class="n">tb</span><span class="p">::</span><span class="n">kK</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">skew</span><span class="p">];</span><span class="w">  </span><span class="o">//</span><span class="w"> </span><span class="n">long</span><span class="w"> </span><span class="ow">and</span><span class="w"> </span><span class="n">skinny</span>
+<span class="w">    </span><span class="n">__shared__</span><span class="w"> </span><span class="n">T</span><span class="w"> </span><span class="n">Bs</span><span class="p">[</span><span class="n">tb</span><span class="p">::</span><span class="n">kK</span><span class="p">][</span><span class="n">tb</span><span class="p">::</span><span class="n">kN</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">skew</span><span class="p">];</span><span class="w">  </span><span class="o">//</span><span class="w"> </span><span class="n">short</span><span class="w"> </span><span class="ow">and</span><span class="w"> </span><span class="n">wide</span>
+<span class="w">    </span><span class="o">//</span><span class="w"> </span><span class="n">non</span><span class="w"> </span><span class="n">quadratic</span><span class="w"> </span><span class="n">to</span><span class="w"> </span><span class="nb">max</span><span class="w"> </span><span class="nb">load</span><span class="w"> </span><span class="n">instruction</span><span class="w"> </span><span class="n">usage</span>
+
+<span class="w">    </span><span class="n">constexpr</span><span class="w"> </span><span class="n">size_t</span><span class="w"> </span><span class="n">n_gld</span><span class="w"> </span><span class="o">=</span>
+<span class="w">        </span><span class="n">CUDA_VECTORIZED_BITS_LOAD</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="p">(</span><span class="n">sizeof</span><span class="p">(</span><span class="n">T</span><span class="p">)</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="mi">8</span><span class="p">);</span><span class="w">  </span><span class="o">//</span><span class="w"> </span><span class="n">bytes</span><span class="w"> </span><span class="n">to</span><span class="w"> </span><span class="n">bits</span>
+
+<span class="w">    </span><span class="k">const</span><span class="w"> </span><span class="n">size_t</span><span class="w"> </span><span class="n">total_threadId</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">blockDim</span><span class="o">.</span><span class="n">x</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">threadIdx</span><span class="o">.</span><span class="n">y</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">threadIdx</span><span class="o">.</span><span class="n">x</span><span class="p">;</span>
+<span class="w">    </span><span class="o">//</span><span class="w"> </span><span class="nb">assert</span><span class="p">(</span><span class="n">total_threadId</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="mi">256</span><span class="p">);</span>
+<span class="w">    </span><span class="k">const</span><span class="w"> </span><span class="n">size_t</span><span class="w"> </span><span class="n">thread_num</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">blockDim</span><span class="o">.</span><span class="n">x</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">blockDim</span><span class="o">.</span><span class="n">y</span><span class="p">;</span>
+
+<span class="w">    </span><span class="k">const</span><span class="w"> </span><span class="n">size_t</span><span class="w"> </span><span class="n">stride_a</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">thread_num</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">n_gld</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">tb</span><span class="p">::</span><span class="n">kK</span><span class="p">;</span>
+<span class="w">    </span><span class="nb">assert</span><span class="p">(</span><span class="n">stride_a</span><span class="w"> </span><span class="o">&lt;=</span><span class="w"> </span><span class="n">tb</span><span class="p">::</span><span class="n">kM</span><span class="p">);</span><span class="w">  </span><span class="o">//</span><span class="w"> </span><span class="n">One</span><span class="w"> </span><span class="n">thread</span><span class="w"> </span><span class="n">needs</span><span class="w"> </span><span class="nb">load</span><span class="w"> </span><span class="n">one</span><span class="w"> </span><span class="n">line</span>
+
+<span class="w">    </span><span class="k">const</span><span class="w"> </span><span class="n">size_t</span><span class="w"> </span><span class="n">stride_b</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">thread_num</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">n_gld</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">tb</span><span class="p">::</span><span class="n">kN</span><span class="p">;</span>
+<span class="w">    </span><span class="nb">assert</span><span class="p">(</span><span class="n">stride_b</span><span class="w"> </span><span class="o">&lt;=</span><span class="w"> </span><span class="n">tb</span><span class="p">::</span><span class="n">kK</span><span class="p">);</span><span class="w">  </span><span class="o">//</span><span class="w"> </span><span class="n">Thread</span><span class="w"> </span><span class="n">needs</span><span class="w"> </span><span class="n">to</span><span class="w"> </span><span class="nb">load</span><span class="w"> </span><span class="n">at</span><span class="w"> </span><span class="n">least</span><span class="w"> </span><span class="n">one</span><span class="w"> </span><span class="n">line</span>
+
+<span class="w">    </span><span class="n">Loader</span><span class="o">&lt;</span><span class="n">T</span><span class="p">,</span><span class="w"> </span><span class="n">tb</span><span class="p">::</span><span class="n">kM</span><span class="p">,</span><span class="w"> </span><span class="n">tb</span><span class="p">::</span><span class="n">kK</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">skew</span><span class="p">,</span><span class="w"> </span><span class="n">Index</span><span class="o">&lt;</span><span class="n">tb</span><span class="p">::</span><span class="n">kM</span><span class="p">,</span><span class="w"> </span><span class="n">tb</span><span class="p">::</span><span class="n">kK</span><span class="p">,</span><span class="w"> </span><span class="n">n_gld</span><span class="o">&gt;&gt;</span><span class="w"> </span><span class="n">LoaderA</span><span class="p">{</span>
+<span class="w">        </span><span class="n">A</span><span class="p">,</span><span class="w"> </span><span class="n">As</span><span class="p">,</span><span class="w"> </span><span class="n">total_threadId</span><span class="p">,</span><span class="w"> </span><span class="n">blockIdx</span><span class="o">.</span><span class="n">y</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">tb</span><span class="p">::</span><span class="n">kM</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">K</span><span class="p">,</span><span class="w"> </span><span class="n">K</span><span class="p">,</span><span class="w"> </span><span class="n">stride_a</span><span class="p">};</span>
+<span class="w">    </span><span class="n">Loader</span><span class="o">&lt;</span><span class="n">T</span><span class="p">,</span><span class="w"> </span><span class="n">tb</span><span class="p">::</span><span class="n">kK</span><span class="p">,</span><span class="w"> </span><span class="n">tb</span><span class="p">::</span><span class="n">kN</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">skew</span><span class="p">,</span><span class="w"> </span><span class="n">Index</span><span class="o">&lt;</span><span class="n">tb</span><span class="p">::</span><span class="n">kK</span><span class="p">,</span><span class="w"> </span><span class="n">tb</span><span class="p">::</span><span class="n">kN</span><span class="p">,</span><span class="w"> </span><span class="n">n_gld</span><span class="o">&gt;&gt;</span><span class="w"> </span><span class="n">LoaderB</span><span class="p">{</span>
+<span class="w">        </span><span class="n">B</span><span class="p">,</span><span class="w"> </span><span class="n">Bs</span><span class="p">,</span><span class="w"> </span><span class="n">total_threadId</span><span class="p">,</span><span class="w"> </span><span class="n">blockIdx</span><span class="o">.</span><span class="n">x</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">tb</span><span class="p">::</span><span class="n">kN</span><span class="p">,</span><span class="w"> </span><span class="n">N</span><span class="p">,</span><span class="w"> </span><span class="n">stride_b</span><span class="p">};</span>
+
+<span class="w">    </span><span class="n">accum_type</span><span class="w"> </span><span class="n">tmp</span><span class="p">[</span><span class="n">wb</span><span class="p">::</span><span class="n">kM</span><span class="p">][</span><span class="n">wb</span><span class="p">::</span><span class="n">kN</span><span class="p">]</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">{</span><span class="mf">0.</span><span class="p">};</span>
+<span class="w">    </span><span class="n">T</span><span class="w"> </span><span class="n">registerA</span><span class="p">[</span><span class="n">wb</span><span class="p">::</span><span class="n">kM</span><span class="p">]</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">{</span><span class="mf">0.</span><span class="p">};</span>
+<span class="w">    </span><span class="n">T</span><span class="w"> </span><span class="n">registerB</span><span class="p">[</span><span class="n">wb</span><span class="p">::</span><span class="n">kN</span><span class="p">]</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">{</span><span class="mf">0.</span><span class="p">};</span>
+
+<span class="w">    </span><span class="o">//</span><span class="w"> </span><span class="n">Needed</span><span class="w"> </span><span class="n">to</span><span class="w"> </span><span class="n">access</span><span class="w"> </span><span class="n">the</span><span class="w"> </span><span class="n">variables</span><span class="w"> </span><span class="n">from</span><span class="w"> </span><span class="n">tmp</span>
+<span class="w">    </span><span class="k">const</span><span class="w"> </span><span class="n">size_t</span><span class="w"> </span><span class="n">tx</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">threadIdx</span><span class="o">.</span><span class="n">x</span><span class="p">;</span>
+<span class="w">    </span><span class="k">const</span><span class="w"> </span><span class="n">size_t</span><span class="w"> </span><span class="n">ty</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">threadIdx</span><span class="o">.</span><span class="n">y</span><span class="p">;</span>
+
+<span class="w">    </span><span class="k">for</span><span class="w"> </span><span class="p">(</span><span class="n">size_t</span><span class="w"> </span><span class="n">bk</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span><span class="w"> </span><span class="n">bk</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="n">K</span><span class="p">;</span><span class="w"> </span><span class="n">bk</span><span class="w"> </span><span class="o">+=</span><span class="w"> </span><span class="n">tb</span><span class="p">::</span><span class="n">kK</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="n">LoaderA</span><span class="o">.</span><span class="n">load</span><span class="p">();</span>
+<span class="w">        </span><span class="n">LoaderB</span><span class="o">.</span><span class="n">load</span><span class="p">();</span>
+<span class="w">        </span><span class="n">LoaderA</span><span class="o">.</span><span class="n">next</span><span class="p">(</span><span class="n">tb</span><span class="p">::</span><span class="n">kK</span><span class="p">);</span>
+<span class="w">        </span><span class="n">LoaderB</span><span class="o">.</span><span class="n">next</span><span class="p">(</span><span class="n">tb</span><span class="p">::</span><span class="n">kK</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">N</span><span class="p">);</span>
+<span class="w">        </span><span class="n">__syncthreads</span><span class="p">();</span>
+<span class="c1">#pragma unroll</span>
+<span class="w">        </span><span class="k">for</span><span class="w"> </span><span class="p">(</span><span class="n">size_t</span><span class="w"> </span><span class="n">k</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span><span class="w"> </span><span class="n">k</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="n">tb</span><span class="p">::</span><span class="n">kK</span><span class="p">;</span><span class="w"> </span><span class="n">k</span><span class="o">++</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="c1">#pragma unroll</span>
+<span class="w">            </span><span class="k">for</span><span class="w"> </span><span class="p">(</span><span class="n">size_t</span><span class="w"> </span><span class="n">i</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span><span class="w"> </span><span class="n">i</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="n">wb</span><span class="p">::</span><span class="n">kM</span><span class="p">;</span><span class="w"> </span><span class="n">i</span><span class="o">++</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">                </span><span class="n">registerA</span><span class="p">[</span><span class="n">i</span><span class="p">]</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">As</span><span class="p">[(</span><span class="n">ty</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">i</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="mi">16</span><span class="p">)][</span><span class="n">k</span><span class="p">];</span>
+<span class="w">            </span><span class="p">};</span>
+<span class="c1">#pragma unroll</span>
+<span class="w">            </span><span class="k">for</span><span class="w"> </span><span class="p">(</span><span class="n">size_t</span><span class="w"> </span><span class="n">i</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span><span class="w"> </span><span class="n">i</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="n">wb</span><span class="p">::</span><span class="n">kN</span><span class="p">;</span><span class="w"> </span><span class="o">++</span><span class="n">i</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">                </span><span class="n">registerB</span><span class="p">[</span><span class="n">i</span><span class="p">]</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Bs</span><span class="p">[</span><span class="n">k</span><span class="p">][</span><span class="n">tx</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">i</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="mi">16</span><span class="p">];</span>
+<span class="w">            </span><span class="p">}</span>
+<span class="c1">#pragma unroll</span>
+<span class="w">            </span><span class="k">for</span><span class="w"> </span><span class="p">(</span><span class="nb nb-Type">int</span><span class="w"> </span><span class="n">i</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span><span class="w"> </span><span class="n">i</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="n">wb</span><span class="p">::</span><span class="n">kM</span><span class="p">;</span><span class="w"> </span><span class="o">++</span><span class="n">i</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="c1">#pragma unroll</span>
+<span class="w">                </span><span class="k">for</span><span class="w"> </span><span class="p">(</span><span class="nb nb-Type">int</span><span class="w"> </span><span class="n">j</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span><span class="w"> </span><span class="n">j</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="n">wb</span><span class="p">::</span><span class="n">kN</span><span class="p">;</span><span class="w"> </span><span class="o">++</span><span class="n">j</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">                    </span><span class="n">tmp</span><span class="p">[</span><span class="n">i</span><span class="p">][</span><span class="n">j</span><span class="p">]</span><span class="w"> </span><span class="o">+=</span><span class="w"> </span><span class="p">(</span><span class="n">accum_type</span><span class="p">)(</span><span class="n">registerA</span><span class="p">[</span><span class="n">i</span><span class="p">]</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">registerB</span><span class="p">[</span><span class="n">j</span><span class="p">]);</span>
+<span class="w">                </span><span class="p">}</span>
+<span class="w">            </span><span class="p">}</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">        </span><span class="n">__syncthreads</span><span class="p">();</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="c1">#pragma unroll</span>
+<span class="w">    </span><span class="k">for</span><span class="w"> </span><span class="p">(</span><span class="n">size_t</span><span class="w"> </span><span class="n">i</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span><span class="w"> </span><span class="n">i</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="n">wb</span><span class="p">::</span><span class="n">kM</span><span class="p">;</span><span class="w"> </span><span class="n">i</span><span class="o">++</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="k">for</span><span class="w"> </span><span class="p">(</span><span class="n">size_t</span><span class="w"> </span><span class="n">j</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span><span class="w"> </span><span class="n">j</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="n">wb</span><span class="p">::</span><span class="n">kN</span><span class="p">;</span><span class="w"> </span><span class="n">j</span><span class="o">++</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="k">const</span><span class="w"> </span><span class="n">size_t</span><span class="w"> </span><span class="n">out</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">(</span><span class="n">ty</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">i</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="mi">16</span><span class="p">)</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">N</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">tx</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">j</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="mi">16</span><span class="w"> </span><span class="o">+</span>
+<span class="w">                               </span><span class="n">block_base_y</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">N</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">block_base_x</span><span class="p">;</span>
+<span class="w">            </span><span class="n">accum_type</span><span class="w"> </span><span class="n">res</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">alpha</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">tmp</span><span class="p">[</span><span class="n">i</span><span class="p">][</span><span class="n">j</span><span class="p">]</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">beta</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="p">(</span><span class="n">accum_type</span><span class="p">)</span><span class="n">C</span><span class="p">[</span><span class="n">out</span><span class="p">];</span>
+<span class="w">            </span><span class="n">C</span><span class="p">[</span><span class="n">out</span><span class="p">]</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">(</span><span class="n">T</span><span class="p">)</span><span class="n">res</span><span class="p">;</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p>The entire code can be found <a href="https://gist.github.com/FabianSchuetze/bec06c3e00976599acc53544ea34f9da">here</a>. Memory bank conflicts can occur when storing to or loading from shared memory. The important parts for memory throughput relate to the <code>Loader</code> class and the scheduling of data loads:</p>
+<div class="highlight"><pre><span></span><code><span class="n">LoaderA</span><span class="o">.</span><span class="n">load</span><span class="p">();</span>
+<span class="n">LoaderB</span><span class="o">.</span><span class="n">load</span><span class="p">();</span>
+<span class="n">LoaderA</span><span class="o">.</span><span class="n">next</span><span class="p">(</span><span class="n">tb</span><span class="p">::</span><span class="n">kK</span><span class="p">);</span>
+<span class="n">LoaderB</span><span class="o">.</span><span class="n">next</span><span class="p">(</span><span class="n">tb</span><span class="p">::</span><span class="n">kK</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">N</span><span class="p">);</span>
+</code></pre></div>
+
+<p><strong>Loading Data from Global to Shared Memory</strong>
+Loading data from shared to global memory is done in several steps. First, a shared memory buffer is created (for example, the shared memory buffer for matrix <code>A</code> is called <code>As</code>). The <code>Loader</code> class encapsulates the memory transfer. The loader class looks as follows:</p>
+<div class="highlight"><pre><span></span><code><span class="n">template</span><span class="w"> </span><span class="o">&lt;</span><span class="n">typename</span><span class="w"> </span><span class="n">T</span><span class="p">,</span><span class="w"> </span><span class="n">size_t</span><span class="w"> </span><span class="n">rows</span><span class="p">,</span><span class="w"> </span><span class="n">size_t</span><span class="w"> </span><span class="n">cols</span><span class="p">,</span><span class="w"> </span><span class="n">typename</span><span class="w"> </span><span class="n">ThreadOffset</span><span class="o">&gt;</span>
+<span class="n">struct</span><span class="w"> </span><span class="n">Loader</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">T</span><span class="w"> </span><span class="p">(</span><span class="o">&amp;</span><span class="n">shmem_</span><span class="p">)[</span><span class="n">rows</span><span class="p">][</span><span class="n">cols</span><span class="p">];</span>
+<span class="w">    </span><span class="n">T</span><span class="w"> </span><span class="o">*</span><span class="n">global_ptr_</span><span class="p">;</span>
+<span class="w">    </span><span class="k">const</span><span class="w"> </span><span class="n">ThreadOffset</span><span class="w"> </span><span class="n">offset_</span><span class="p">;</span>
+<span class="w">    </span><span class="k">const</span><span class="w"> </span><span class="n">size_t</span><span class="w"> </span><span class="n">stride_</span><span class="p">;</span>
+<span class="w">    </span><span class="k">const</span><span class="w"> </span><span class="n">size_t</span><span class="w"> </span><span class="n">ld_</span><span class="p">;</span>
+<span class="w">    </span><span class="n">__host__</span><span class="w"> </span><span class="n">__device__</span><span class="w"> </span><span class="n">Loader</span><span class="p">(</span><span class="n">T</span><span class="w"> </span><span class="o">*</span><span class="n">global_ptr</span><span class="p">,</span><span class="w"> </span><span class="n">T</span><span class="w"> </span><span class="p">(</span><span class="o">&amp;</span><span class="n">shmem</span><span class="p">)[</span><span class="n">rows</span><span class="p">][</span><span class="n">cols</span><span class="p">],</span>
+<span class="w">                               </span><span class="n">size_t</span><span class="w"> </span><span class="n">threadId</span><span class="p">,</span><span class="w"> </span><span class="n">size_t</span><span class="w"> </span><span class="n">blockOffset</span><span class="p">,</span><span class="w"> </span><span class="n">size_t</span><span class="w"> </span><span class="n">ld</span><span class="p">,</span>
+<span class="w">                               </span><span class="n">size_t</span><span class="w"> </span><span class="n">stride</span><span class="p">)</span>
+<span class="w">        </span><span class="p">:</span><span class="w"> </span><span class="n">global_ptr_</span><span class="p">(</span><span class="n">global_ptr</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">blockOffset</span><span class="p">),</span>
+<span class="w">          </span><span class="n">shmem_</span><span class="p">(</span><span class="n">shmem</span><span class="p">),</span>
+<span class="w">          </span><span class="n">offset_</span><span class="p">(</span><span class="n">threadId</span><span class="p">),</span>
+<span class="w">          </span><span class="n">ld_</span><span class="p">(</span><span class="n">ld</span><span class="p">),</span>
+<span class="w">          </span><span class="n">stride_</span><span class="p">(</span><span class="n">stride</span><span class="p">){};</span>
+<span class="w">    </span><span class="n">__device__</span><span class="w"> </span><span class="nb nb-Type">void</span><span class="w"> </span><span class="nb">load</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="k">const</span><span class="w"> </span><span class="n">size_t</span><span class="w"> </span><span class="n">global_idx</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">offset_</span><span class="o">.</span><span class="n">row</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">ld_</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">offset_</span><span class="o">.</span><span class="n">col</span><span class="p">;</span>
+<span class="c1">#pragma unroll</span>
+<span class="w">        </span><span class="k">for</span><span class="w"> </span><span class="p">(</span><span class="n">size_t</span><span class="w"> </span><span class="n">row</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span><span class="w"> </span><span class="n">row</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="n">rows</span><span class="p">;</span><span class="w"> </span><span class="n">row</span><span class="w"> </span><span class="o">+=</span><span class="w"> </span><span class="n">stride_</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="k">const</span><span class="w"> </span><span class="n">T</span><span class="w"> </span><span class="o">*</span><span class="n">src</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">global_ptr_</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">row</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">ld_</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">global_idx</span><span class="p">;</span>
+<span class="w">            </span><span class="n">T</span><span class="w"> </span><span class="o">*</span><span class="n">dst</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="o">&amp;</span><span class="n">shmem_</span><span class="p">[</span><span class="n">offset_</span><span class="o">.</span><span class="n">row</span><span class="p">][</span><span class="n">offset_</span><span class="o">.</span><span class="n">col</span><span class="p">]</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">row</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">cols</span><span class="p">;</span>
+<span class="w">            </span><span class="n">int4</span><span class="w"> </span><span class="n">t</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">reinterpret_cast</span><span class="o">&lt;</span><span class="k">const</span><span class="w"> </span><span class="n">int4</span><span class="w"> </span><span class="o">*&gt;</span><span class="p">(</span><span class="n">src</span><span class="p">)[</span><span class="mi">0</span><span class="p">];</span>
+<span class="w">            </span><span class="n">reinterpret_cast</span><span class="o">&lt;</span><span class="n">int4</span><span class="w"> </span><span class="o">*&gt;</span><span class="p">(</span><span class="n">dst</span><span class="p">)[</span><span class="mi">0</span><span class="p">]</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">t</span><span class="p">;</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="p">};</span>
+</code></pre></div>
+
+<p>The constructor calculates an offset into the global matrix and creates a pointer to the shared memory. Global to shared memory is loaded in the function <code>load</code>: At first, each thread calculates the appropriate entry point to the global memory. Loading data happens inside a loop: The source and destination pointer for the thread are calculated, and each thread moves 128-bit (the maximum payload) from global to shared memory. It is instructive to look at the generated PTX code for the load instructions. Thi is:</p>
+<div class="highlight"><pre><span></span><code><span class="k">[Cuda:]</span>
+<span class="na">int4 t</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s">reinterpret_cast&lt;const int4 *&gt;(src)[0]</span><span class="c1">;</span>
+<span class="na">reinterpret_cast&lt;int4 *&gt;(dst)[0]</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s">t</span><span class="c1">;</span>
+<span class="k">[PTX:]</span>
+<span class="na">ld.global.nc.v4.u32     {%r26, %r27, %r28, %r29}, [%rd73];</span>
+<span class="na">st.shared.v4.u32        [%r25], {%r26, %r27, %r28, %r29};</span>
+</code></pre></div>
+
+<p>Loading global memory proceeds in a non-coalesced manner. This means the load goes directly to the registers, bypassing the L1 cache to avoid cache pollution. It is vectorized and comprises four unsigned ints. The data is stored in the registers 26-29, and register 73 contains the load address. The values are then stored in shared memory.</p>
+<p>The entire program above achieves a throughput of 8 TFlops on an A5000. Such throughput represents 40 \% of the available throughput of the GPU. When storing the memory, the threads might access the same bank, and their access gets serialized. In fact, the profiler identifies 1,8 million bank conflicts, causing the threads to stall. The following subsection shows how to avoid such stalls.  </p>
+<p><strong>Addressing Shared Memory Conflicts</strong></p>
+<p>A solution to avoid bank conflicts is using async memory transfers. Async memory transfer from CPU to GPU memory exists for a long time. Async global to shared memory transfers were introduced with PTX 7.0 and require a compute capability 8.0 or above (Ampere microarchitecture). Async copies allow the threads within a warp to continue progressing after issuing a memory load. PTX <a href="https://docs.nvidia.com/cuda/parallel-thread-execution/index.html?highlight=async#data-movement-and-conversion-instructions-cp-async">splits</a> a load in three instructions:</p>
+<ul>
+<li>[Initiate] Done with <code>cp.async</code>: Initiating memory transfers and queues up the work. There's no guaranteed ordering between different calls to <code>cp.async</code>, and threads are not informed when the data is ready.</li>
+<li>[Commit] Done with <code>cp.async.commit_group</code>: Associates all prior calls to <code>cp.async</code> with a group.</li>
+<li>[Wait] Done with <code>cp.async.wait_group</code>: A barrier (fence) at which all threads wait for the memory operations associated with the group to complete. Serves as coordination and informs the threads that the data is ready.</li>
+</ul>
+<p>The function <code>load</code> of the loader class is modified as follows:</p>
+<div class="highlight"><pre><span></span><code><span class="c1">#define CP_ASYNC_CG(dst, src, Bytes)                                       \</span>
+<span class="w">    </span><span class="n">asm</span><span class="w"> </span><span class="n">volatile</span><span class="p">(</span><span class="w">                                                          </span>\
+<span class="w">        </span><span class="s2">&quot;cp.async.cg.shared.global.L2::128B [%0], [%1], %2;</span><span class="se">\n</span><span class="s2">&quot;</span><span class="w"> </span><span class="p">::</span><span class="s2">&quot;r&quot;</span><span class="p">(</span><span class="n">dst</span><span class="p">),</span><span class="w"> </span>\
+<span class="w">        </span><span class="s2">&quot;l&quot;</span><span class="p">(</span><span class="n">src</span><span class="p">),</span><span class="w"> </span><span class="s2">&quot;n&quot;</span><span class="p">(</span><span class="n">Bytes</span><span class="p">))</span>
+
+<span class="n">__device__</span><span class="w"> </span><span class="nb nb-Type">void</span><span class="w"> </span><span class="nb">load</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="k">const</span><span class="w"> </span><span class="n">size_t</span><span class="w"> </span><span class="n">global_idx</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">offset_</span><span class="o">.</span><span class="n">row</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">ld_</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">offset_</span><span class="o">.</span><span class="n">col</span><span class="p">;</span>
+<span class="w">        </span><span class="n">constexpr</span><span class="w"> </span><span class="n">size_t</span><span class="w"> </span><span class="n">load_bytes</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">16</span><span class="p">;</span>
+<span class="c1">#pragma unroll</span>
+<span class="w">        </span><span class="k">for</span><span class="w"> </span><span class="p">(</span><span class="n">size_t</span><span class="w"> </span><span class="n">row</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span><span class="w"> </span><span class="n">row</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="n">rows</span><span class="p">;</span><span class="w"> </span><span class="n">row</span><span class="w"> </span><span class="o">+=</span><span class="w"> </span><span class="n">stride_</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">                </span><span class="k">const</span><span class="w"> </span><span class="n">T</span><span class="w"> </span><span class="o">*</span><span class="n">src</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">global_ptr_</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">row</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">ld_</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">global_idx</span><span class="p">;</span>
+<span class="w">                </span><span class="n">T</span><span class="w"> </span><span class="o">*</span><span class="n">dst</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="o">&amp;</span><span class="n">shmem_</span><span class="p">[</span><span class="n">offset_</span><span class="o">.</span><span class="n">row</span><span class="p">][</span><span class="n">offset_</span><span class="o">.</span><span class="n">col</span><span class="p">]</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">row</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">cols</span><span class="p">;</span>
+<span class="w">                </span><span class="n">uint32_t</span><span class="w"> </span><span class="n">pos_in_ss</span><span class="w"> </span><span class="o">=</span>
+<span class="w">                        </span><span class="n">__cvta_generic_to_shared</span><span class="p">(</span><span class="n">reinterpret_cast</span><span class="o">&lt;</span><span class="n">int4</span><span class="w"> </span><span class="o">*&gt;</span><span class="p">(</span><span class="n">dst</span><span class="p">));</span>
+<span class="w">                </span><span class="n">CP_ASYNC_CG</span><span class="p">(</span><span class="n">pos_in_ss</span><span class="p">,</span><span class="w"> </span><span class="n">src</span><span class="p">,</span><span class="w"> </span><span class="n">load_bytes</span><span class="p">);</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p>The copy async instruction requires the destination operand to be in the shared space. As before, 16 bytes get loaded. The generated PTX for this function is:</p>
+<div class="highlight"><pre><span></span><code><span class="nt">cp</span><span class="p">.</span><span class="nc">async</span><span class="p">.</span><span class="nc">cg</span><span class="p">.</span><span class="nc">shared</span><span class="p">.</span><span class="nc">global</span><span class="p">.</span><span class="nc">L2</span><span class="p">::</span><span class="nd">128B</span><span class="w"> </span><span class="cp">[</span><span class="o">%</span><span class="nx">r17</span><span class="cp">]</span><span class="o">,</span><span class="w"> </span><span class="cp">[</span><span class="o">%</span><span class="nx">rd67</span><span class="cp">]</span><span class="o">,</span><span class="w"> </span><span class="nt">16</span><span class="o">;</span>
+</code></pre></div>
+
+<p>First, no <code>ld</code> or <code>st</code> instruction is present anymore. The instruction mandates an async copy using the global cache (L2) from global to shared. This is only a performance hint by the compiler, and the runtime may ignore it. This instruction only initiates a load, but the commit and wait instructions follow afterward. This is:</p>
+<div class="highlight"><pre><span></span><code><span class="n">LoaderA</span><span class="o">.</span><span class="n">load</span><span class="p">();</span>
+<span class="n">LoaderB</span><span class="o">.</span><span class="n">load</span><span class="p">();</span>
+<span class="n">LoaderA</span><span class="o">.</span><span class="n">next</span><span class="p">(</span><span class="n">tb</span><span class="p">::</span><span class="n">kK</span><span class="p">);</span>
+<span class="n">LoaderB</span><span class="o">.</span><span class="n">next</span><span class="p">(</span><span class="n">tb</span><span class="p">::</span><span class="n">kK</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">N</span><span class="p">);</span>
+<span class="n">asm</span><span class="w"> </span><span class="n">volatile</span><span class="p">(</span><span class="s2">&quot;cp.async.commit_group&quot;</span><span class="p">);</span>
+<span class="n">asm</span><span class="w"> </span><span class="n">volatile</span><span class="p">(</span><span class="s2">&quot;cp.async.wait_group 0&quot;</span><span class="p">);</span>
+<span class="n">__syncthreads</span><span class="p">();</span>
+</code></pre></div>
+
+<p>Instead of blocking the memory load in the loop of the <code>load</code> function, the threads continue their work. After initiating all calls, the threads commit their work to group zero and wait for the loads to complete. Using only one group is done for simplicity, but (strictly speaking) the loads for matrix <code>B</code> don't need to be ready concurrently as loads from matrix <code>A</code>.</p>
+<p>With these few changes, the throughput of the kernel increases to 12 TFlops: A 50 % increase. The profiler also does not identify any bank conflicts anymore. Avoiding
+bank conflicts and async memory loads are a core element of high-performance Cuda
+kernels.</p>                </article>
+            </aside><!-- /#featured -->
+                <section id="content" class="body">
+                    <h1>Other articles</h1>
+                    <hr />
+                    <ol id="posts-list" class="hfeed">
+
+            <li><article class="hentry">
+                <header>
+                    <h1><a href="/first-post.html" rel="bookmark"
+                           title="Permalink to Website">Website</a></h1>
+                </header>
+
+                <div class="entry-content">
+<footer class="post-info">
+        <abbr class="published" title="2022-06-10T00:00:00+02:00">
+                Published: Fr 10 Juni 2022
+        </abbr>
+
+        <address class="vcard author">
+                By                         <a class="url fn" href="/author/fabian-schuetze.html">Fabian Schuetze</a>
+        </address>
+<p>In <a href="/category/misc.html">misc</a>.</p>
+<p>tags: <a href="/tag/reflection.html">reflection</a> <a href="/tag/self-improvement.html">self-improvement</a> </p>
+</footer><!-- /.post-info -->                <p>This is my first post</p>
+                <a class="readmore" href="/first-post.html">read more</a>
+                </div><!-- /.entry-content -->
+            </article></li>
+                </ol><!-- /#posts-list -->
+                </section><!-- /#content -->
+        <section id="extras" class="body">
+                <div class="blogroll">
+                        <h2>links</h2>
+                        <ul>
+                            <li><a href="https://getpelican.com/">Pelican</a></li>
+                            <li><a href="https://www.python.org/">Python.org</a></li>
+                            <li><a href="https://palletsprojects.com/p/jinja/">Jinja2</a></li>
+                            <li><a href="#">You can modify those links in your config file</a></li>
+                        </ul>
+                </div><!-- /.blogroll -->
+                <div class="social">
+                        <h2>social</h2>
+                        <ul>
+
+                            <li><a href="#">You can add links in your config file</a></li>
+                            <li><a href="#">Another social link</a></li>
+                        </ul>
+                </div><!-- /.social -->
+        </section><!-- /#extras -->
+
+        <footer id="contentinfo" class="body">
+                <address id="about" class="vcard body">
+                Proudly powered by <a rel="nofollow" href="https://getpelican.com/">Pelican</a>, which takes great advantage of <a rel="nofollow" href="https://www.python.org/">Python</a>.
+                </address><!-- /#about -->
+
+                <p>The theme is by <a rel="nofollow" href="https://www.smashingmagazine.com/2009/08/designing-a-html-5-layout-from-scratch/">Smashing Magazine</a>, thanks!</p>
+        </footer><!-- /#contentinfo -->
+
+</body>
+</html>
