@@ -4,22 +4,28 @@
         <meta charset="utf-8" />
         <meta name="viewport" content="width=device-width, initial-scale=1.0" />
         <meta name="generator" content="Pelican" />
-        <title> - Fabian Schuetze</title>
+        <title>"GemmCuda"</title>
         <link rel="stylesheet" href="https://fabianschuetze.github.io/theme/css/main.css" />
+        <meta name="description" content="Reverse-Engeneering CuBLAS: Achieving CuBLAS performance with Tensor Cores by Mimicking SASS Instructions This article reverse-engineers a Cuda..." />
 </head>
 
 <body id="index" class="home">
         <header id="banner" class="body">
                 <h1><a href="https://fabianschuetze.github.io/"></a></h1>
                 <nav><ul>
-                    <li><a href="https://fabianschuetze.github.io/category/articles.html">articles</a></li>
+                    <li class="active"><a href="https://fabianschuetze.github.io/category/articles.html">articles</a></li>
                     <li><a href="https://fabianschuetze.github.io/category/misc.html">misc</a></li>
                 </ul></nav>
         </header><!-- /#banner -->
+<section id="content" class="body">
+  <article>
+    <header>
+      <h1 class="entry-title">
+        <a href="https://fabianschuetze.github.io/gemmcuda.html" rel="bookmark"
+           title="Permalink to "GemmCuda"">"GemmCuda"</a></h1>
+    </header>
 
-            <aside id="featured" class="body">
-                <article>
-                    <h1 class="entry-title"><a href="https://fabianschuetze.github.io/gemmcuda.html">"GemmCuda"</a></h1>
+    <div class="entry-content">
 <footer class="post-info">
         <abbr class="published" title="2024-03-14T00:00:00+01:00">
                 Published: Do 14 März 2024
@@ -30,7 +36,7 @@
         </address>
 <p>In <a href="https://fabianschuetze.github.io/category/articles.html">articles</a>.</p>
 
-</footer><!-- /.post-info --><h1>Reverse-Engeneering CuBLAS:  Achieving CuBLAS performance with Tensor Cores by Mimicking SASS Instructions</h1>
+</footer><!-- /.post-info -->      <h1>Reverse-Engeneering CuBLAS:  Achieving CuBLAS performance with Tensor Cores by Mimicking SASS Instructions</h1>
 <p>This article reverse-engineers a Cuda GEMM kernel with Tensor cores by looking at the SASS code for a CuBLAS invocation. The handwritten kernel gets within striking distance of the performance of the CuBLAS kernel. Re-engineering the CuBLAS kernel is not too difficult when using good abstractions as building blocks.  </p>
 <p>CuBLAS is the BLAS library provided by Nvidia to multiply matrices. The API is well documented, but the source code is not published. The kernels provided with CuBLAS are heavily tuned, and the best-performing kernel gets selected at runtime. The runtime choses among many kernels: One can count ~5000 kernels containing GEMM in its name, and CuBLAS ships a whopping 100 MB. In comparison, the BLAS library provided by Ubuntu, libblas, ships 600kb.</p>
 <p>The performance of three different handwritten CUDA kernels and the CuBLAS version is shown below:</p>
@@ -255,59 +261,11 @@ Two changes are necessary for asynchronous loading. First, the new load function
 </code></pre></div>
 
 <p>The prologue to the main loop begins by issuing two shared memory loads. The threads block until only the first one is completed, while the second one remains in flight. Then, the first register file is loaded. The main loop begins by loading a further fragment of shared memory, and the tensor cores operate on the previous fragment. When all local registers are filled, the shared memory of the first block has been exhausted. No computation can be overlaid over the memory copies anymore. Another load is issued, and the warps wait until the previous load is completed.</p>
-<p>With these advances, the throughput of the kernel advances to 89 TFLOPS and reaches within 95% of CuBLAS performance. Further gains can be reaped by writing the matrix C through shared memory back to global memory. The kernel throughput then advances to 91 TFLOPS, 1 TFLOP behind the CuBlas kernel.</p>                </article>
-            </aside><!-- /#featured -->
-                <section id="content" class="body">
-                    <h1>Other articles</h1>
-                    <hr />
-                    <ol id="posts-list" class="hfeed">
+<p>With these advances, the throughput of the kernel advances to 89 TFLOPS and reaches within 95% of CuBLAS performance. Further gains can be reaped by writing the matrix C through shared memory back to global memory. The kernel throughput then advances to 91 TFLOPS, 1 TFLOP behind the CuBlas kernel.</p>
+    </div><!-- /.entry-content -->
 
-            <li><article class="hentry">
-                <header>
-                    <h1><a href="https://fabianschuetze.github.io/bankconflictscuda.html" rel="bookmark"
-                           title="Permalink to "BankConflictsCuda"">"BankConflictsCuda"</a></h1>
-                </header>
-
-                <div class="entry-content">
-<footer class="post-info">
-        <abbr class="published" title="2024-02-16T00:00:00+01:00">
-                Published: Fr 16 Februar 2024
-        </abbr>
-
-        <address class="vcard author">
-                By                         <a class="url fn" href="https://fabianschuetze.github.io/author/fabian-schuetze.html">Fabian Schuetze</a>
-        </address>
-<p>In <a href="https://fabianschuetze.github.io/category/articles.html">articles</a>.</p>
-
-</footer><!-- /.post-info -->                <h1>Avoiding Memory Bank Conflicts in Cuda Programs</h1>
-<p>Global memory access latencies are very high (relative to computing latencies) and a common source of under-utilization of CPUs and GPUs. Accessing memory efficiently is particularly important for harnessing the power of vector processors, such as SIMD processors and GPUs. Memory banks have …</p>
-                <a class="readmore" href="https://fabianschuetze.github.io/bankconflictscuda.html">read more</a>
-                </div><!-- /.entry-content -->
-            </article></li>
-
-            <li><article class="hentry">
-                <header>
-                    <h1><a href="https://fabianschuetze.github.io/first-post.html" rel="bookmark"
-                           title="Permalink to Website">Website</a></h1>
-                </header>
-
-                <div class="entry-content">
-<footer class="post-info">
-        <abbr class="published" title="2022-06-10T00:00:00+02:00">
-                Published: Fr 10 Juni 2022
-        </abbr>
-
-        <address class="vcard author">
-                By                         <a class="url fn" href="https://fabianschuetze.github.io/author/fabian-schuetze.html">Fabian Schuetze</a>
-        </address>
-<p>In <a href="https://fabianschuetze.github.io/category/misc.html">misc</a>.</p>
-<p>tags: <a href="https://fabianschuetze.github.io/tag/reflection.html">reflection</a> <a href="https://fabianschuetze.github.io/tag/self-improvement.html">self-improvement</a> </p>
-</footer><!-- /.post-info -->                <p>This is my first post</p>
-                <a class="readmore" href="https://fabianschuetze.github.io/first-post.html">read more</a>
-                </div><!-- /.entry-content -->
-            </article></li>
-                </ol><!-- /#posts-list -->
-                </section><!-- /#content -->
+  </article>
+</section>
         <section id="extras" class="body">
                 <div class="blogroll">
                         <h2>links</h2>
