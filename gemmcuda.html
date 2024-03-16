@@ -262,6 +262,7 @@ Two changes are necessary for asynchronous loading. First, the new load function
 
 <p>The prologue to the main loop begins by issuing two shared memory loads. The threads block until only the first one is completed, while the second one remains in flight. Then, the first register file is loaded. The main loop begins by loading a further fragment of shared memory, and the tensor cores operate on the previous fragment. When all local registers are filled, the shared memory of the first block has been exhausted. No computation can be overlaid over the memory copies anymore. Another load is issued, and the warps wait until the previous load is completed.</p>
 <p>With these advances, the throughput of the kernel advances to 89 TFLOPS and reaches within 95% of CuBLAS performance. Further gains can be reaped by writing the matrix C through shared memory back to global memory. The kernel throughput then advances to 91 TFLOPS, 1 TFLOP behind the CuBlas kernel.</p>
+<p>© 2024 Fabian Schuetze</p>
     </div><!-- /.entry-content -->
 
   </article>
