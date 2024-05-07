@@ -6,7 +6,7 @@
         <meta name="generator" content="Pelican" />
         <title>"GemmCuda"</title>
         <link rel="stylesheet" href="https://fabianschuetze.github.io/theme/css/main.css" />
-        <meta name="description" content="Reverse-Engeneering CuBLAS: Achieving CuBLAS performance with Tensor Cores by Mimicking SASS Instructions This article reverse-engineers a Cuda..." />
+        <meta name="description" content="Reverse-Engineering cuBLAS: Achieving cuBLAS performance with Tensor Cores by Mimicking SASS Instructions 1. Importance of GEMM and GPUs Matrix..." />
 </head>
 
 <body id="index" class="home">
@@ -36,19 +36,21 @@
         </address>
 <p>In <a href="https://fabianschuetze.github.io/category/articles.html">articles</a>.</p>
 
-</footer><!-- /.post-info -->      <h1>Reverse-Engeneering CuBLAS:  Achieving CuBLAS performance with Tensor Cores by Mimicking SASS Instructions</h1>
-<p>This article reverse-engineers a Cuda GEMM kernel with Tensor cores by looking at the SASS code for a CuBLAS invocation. The handwritten kernel gets within striking distance of the performance of the CuBLAS kernel. Re-engineering the CuBLAS kernel is not too difficult when using good abstractions as building blocks.  </p>
-<p>CuBLAS is the BLAS library provided by Nvidia to multiply matrices. The API is well documented, but the source code is not published. The kernels provided with CuBLAS are heavily tuned, and the best-performing kernel gets selected at runtime. The runtime choses among many kernels: One can count ~5000 kernels containing GEMM in its name, and CuBLAS ships a whopping 100 MB. In comparison, the BLAS library provided by Ubuntu, libblas, ships 600kb.</p>
-<p>The performance of three different handwritten CUDA kernels and the CuBLAS version is shown below:</p>
+</footer><!-- /.post-info -->      <h1>Reverse-Engineering cuBLAS:  Achieving cuBLAS performance with Tensor Cores by Mimicking SASS Instructions</h1>
+<h2>1. Importance of GEMM and GPUs</h2>
+<p>Matrix multiplication is at the heart of linear algebra and the core of scientific, engineering, and statistical computation. Many variants of matrix multiplication can be expressed to interface with the Basic Linear Algebra Subprograms (BLAS). The BLAS is the de facto standard low-level interface for matrix multiplications, and its influence is hard to overstate. For example, Nature named the BLAS one of <a href="https://www.nature.com/articles/d41586-021-00075-2">ten computer codes that transformed science</a>. Moreover, Jack J. Dongarra received the <a href="https://awards.acm.org/about/2021-turing">Turing Award in 2021</a> as the "primary implementor or principal investigator for [...] BLAS. [...] The libraries are used, practically universally, for high performance scientific and engineering computation on machines ranging from laptops to the world’s fastest supercomputers.". Finally, with C++26, programmers can interface with the BLAS directly from C++ (under the std::linalg namespace), thanks to P1637.</p>
+<p>Because the low-level interface for matrix multiplication adheres to a de facto standard and its importance, hardware vendors offer dedicated implementations. These libraries are highly optimized, but their source code is often undisclosed.  Matrix multiplications comprise many small and independent computations and are well-suited for GPUs. Consequently, AMD, ARM, Nvidia, and Intel offer libraries for their GPUs. GPUs are, in essence, vector processors. They have simple (compared to modern CPUs) but enormous numbers of cores. Their memory units are also simple but provide huge throughput. To attain maximum performance, programmers commonly explicitly control data loading into caches.</p>
+<p>This article extracts the essence of such computations by reverse-engineering a matrix multiplication with Nvidia's BLAS library (cuBLAS). The implementation is simple yet instructive and attains performance almost on par with the cuBLAS variant. Re-engineering the cuBLAS kernel is not too difficult when using good abstractions as building blocks. The kernels provided with cuBLAS are heavily tuned, and the best-performing kernel gets selected at runtime. The runtime chooses among many kernels. One can count ~5000 kernels containing GEMM in its name, and cuBLAS ships a whopping 100MB. In comparison, the BLAS library provided by Ubuntu, libblas, ships 600KB.</p>
+<p>The performance of three different handwritten CUDA kernels and the cuBLAS version is shown below:</p>
 <p><img alt="Performance" src="https://fabianschuetze.github.io/images/TFLOPS.png"></p>
-<p>The three versions differ in their use of PTX primitives and the degree of instruction-level parallelism attained (ILP). A high ILP can be achieved by writing efficient abstractions and placing them well in the code to permit prefetching and avoiding pipeline stalls. Modern PTX instructions need to be used to permit asynchronous and highly efficient loading of global memory. This efficiency is documented by the kernels ILP, which is:</p>
+<p>The three versions differ in their use of PTX (which can be understood as a mid-level IR for Nvidia GPUs) primitives and the degree of instruction-level parallelism (ILP) attained. A high ILP can be achieved by writing efficient abstractions and placing them well in the code to permit prefetching and avoiding pipeline stalls. PTX  Modern PTX instructions need to be used to permit asynchronous and highly efficient loading of global memory. This efficiency is documented by the kernels ILP, which is:</p>
 <p><img alt="ILP" src="https://fabianschuetze.github.io/images/ILP.png"></p>
-<p>Note, for users used to CPU optimization, the ILP is extremly high, which is explained by the extensive parallelism GPUs offer.</p>
+<p>Note, for users used to CPU optimization, the ILP is extremely high, which is explained by the extensive parallelism GPUs offer.</p>
 <p>This article proceeds in the following stages:
 First, the basic GEMM implementation using Tensor cores is shown.
-Second, the SASS (Cuda assembly) code for the highly optimized Cuda kernel is analyzed, and differences between the instructions of the basic implementation are identified.
-The basic implementation is refined in two steps to reach performance parity with Cublas.</p>
-<h2>1.  Basic GEMM Implementation</h2>
+Second, the SASS (CUDA assembly) code for the highly optimized CUDA kernel is analyzed, and differences between the instructions of the basic implementation are identified.
+The basic implementation is refined in two steps to reach performance parity with cuBLAS.</p>
+<h2>2.  Basic GEMM Implementation</h2>
 <p>The main loop of the basic implementation of a GEMM kernel with tensor cores is:</p>
 <div class="highlight"><pre><span></span><code><span class="k">for</span><span class="w"> </span><span class="p">(</span><span class="kt">size_t</span><span class="w"> </span><span class="n">block</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span><span class="w"> </span><span class="n">block</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="n">K</span><span class="p">;</span><span class="w"> </span><span class="n">block</span><span class="w"> </span><span class="o">+=</span><span class="w"> </span><span class="n">Threadblock</span><span class="o">::</span><span class="n">kK</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
 <span class="w">     </span><span class="n">LoaderA</span><span class="p">.</span><span class="n">load_blocking</span><span class="p">();</span>
@@ -70,7 +72,7 @@ The basic implementation is refined in two steps to reach performance parity wit
 <span class="p">}</span>
 </code></pre></div>
 
-<p>The code above documents the basic structure of a decent GEMM kernel with tensor cores: Looping along the K (inner) dimension of the matrix product in blocks, the kernel loads blocks of the matrices A and B into shared memory. The load function is named <code>load_blocking</code> (which already provides a glimpse at future optimizations). The kernel then uses a loop nest to compute the matrix product over these blocks. Smaller blocks of the shared memory get loaded into local register files, and its matrix product gets calculated. The kernel reaches about 60TFlops on an A5000, or ⅔ of the GPU limit.</p>
+<p>The code above documents the basic structure of a decent GEMM kernel with tensor cores: Looping along the K (inner) dimension of the matrix product in blocks, the kernel loads blocks of the matrices A and B into shared memory. The load function is named <code>load_blocking</code> (which already provides a glimpse at future optimizations). The kernel then uses a nested loop to compute the matrix product over these blocks. Smaller blocks of the shared memory get loaded into local register files, and their matrix product gets calculated. The kernel reaches about 60TFLOPS on an A5000, or ⅔ of the GPU limit.</p>
 <p>The code above gets compiled to the following SASS assembly:</p>
 <div class="highlight"><pre><span></span><code><span class="w">    </span>...
 <span class="w">    </span>LDG.E.128.CONSTANT<span class="w"> </span>R72,<span class="w"> </span><span class="o">[</span>R72.64<span class="o">]</span>
@@ -87,11 +89,11 @@ The basic implementation is refined in two steps to reach performance parity wit
 <span class="w">    </span>BAR.SYNC<span class="w"> </span>0x0
 </code></pre></div>
 
-<p>The assembly reveals the inner workings of the code above: First, <code>load_blocking</code>stores 128 bits from global memory into thread-local registers. After the global loads, all threads in the warp wait at a barrier. Then, the threads store the loaded data in shared memory, and all threads in a block sync. Furthermore, data from shared memory is loaded as a matrix for processing by the tensor cores. Then, a tensor core matrix multiplication with half-floats ensues. Finally, all threads in the block wait at a barrier before the loop starts again. The way data is loaded is pictured in the following graph:</p>
+<p>The assembly reveals the inner workings of the code above: First, <code>load_blocking</code> stores 128 bits from global memory into thread-local registers. After the global loads, all threads in the warp wait at a barrier. Then, the threads store the loaded data in shared memory, and all threads in a block sync. Furthermore, data from shared memory is loaded as a matrix for processing by the tensor cores. Then, a tensor core matrix multiplication with half-floats ensues. Finally, all threads in the block wait at a barrier before the loop starts again. The way data is loaded is pictured in the following graph:</p>
 <p><img alt="Blocking" src="https://fabianschuetze.github.io/images/blocking.png"></p>
-<p>From the very right, 255MB are loaded from device memory to the L2 Cache before landing in the L1 Cache. As can be seen in the top left of the figure, there are 3.41m instructions used to load data into the local registers. From the local registers, the data is stored again in the shared memory (a portion of the L1 cache) in 3.15m requests. From the shared memory, the data gets accessed in 11.53m requests.</p>
-<h2>2. SASS code for CuBLAS assembly code</h2>
-<p>The SASS code for the CuBLAS kernel is interesting. An abbreviated version reads as follows:</p>
+<p>From the very right, 255MB are loaded from device memory to the L2 Cache before landing in the L1 Cache. As can be seen in the top left of the figure, there are 3.41M instructions used to load data into the local registers. From the local registers, the data is stored again in the shared memory (a portion of the L1 cache) in 3.15M requests. From the shared memory, the data gets accessed in 11.53M requests.</p>
+<h2>3. SASS code for cuBLAS assembly code</h2>
+<p>The SASS code for the cuBLAS kernel is interesting. An abbreviated version reads as follows:</p>
 <div class="highlight"><pre><span></span><code><span class="w">    </span>HMMA.16816.F32<span class="w"> </span>R0,<span class="w"> </span>R152,<span class="w"> </span>R184,<span class="w"> </span>R0
 <span class="w">    </span>LDSM.16.MT88.4<span class="w"> </span>R168,<span class="w"> </span><span class="o">[</span>R137+UR8+0x800<span class="o">]</span>
 <span class="w">    </span>LDGSTS.E.BYPASS.LTC128B.128.CONSTANT<span class="w"> </span><span class="o">[</span>R129+UR4+0x3000<span class="o">]</span>,<span class="w"> </span><span class="o">[</span>R130.64+0x180<span class="o">]</span>
@@ -106,13 +108,13 @@ The basic implementation is refined in two steps to reach performance parity wit
 
 <p>The assembly code highlights several aspects:
 The main loop starts with a matrix multiplication instead of a memory load.
-The global load <code>LDGSTS.E.BYPASS.LTC128B.128.CONSTANT</code> differs from the load in the basic GEMM implementation, <code>LDG.E.128.CONSTANT R72</code>: Firstly, It bypasses the register and stores the data directly in shared memory. Furthermore, it is an asynchronous load and does not block the treads. Non-blocking requires a separate memory fence to signal that the data is ready.
+The global load <code>LDGSTS.E.BYPASS.LTC128B.128.CONSTANT</code> differs from the load in the basic GEMM implementation, <code>LDG.E.128.CONSTANT R72</code>: Firstly, it bypasses the register and stores the data directly in shared memory. Furthermore, it is an asynchronous load and does not block the threads. Non-blocking requires a separate memory fence to signal when the data is ready.
 Such a barrier is the dependency barrier <code>DEPBAR.LE.</code>
-Finally, the instructions are mixed: There is no linear separation between loading data and operating on it, but a heavy mixture of instructions.
-The CuBLAS kernel achieves ~90TFLops. The following two kernels describe how to write code that produces similar SASS and attains the same performance.</p>
-<h2>3. Improvement I: Buffering</h2>
+Finally, the instructions are interleaved: There is no linear separation between loading data and operating on it, but a heavy mixture of instructions.
+The cuBLAS kernel achieves ~90TFLOPS. The following two kernels describe how to write code that produces similar SASS and attains the same performance.</p>
+<h2>4. Improvement I: Buffering</h2>
 <h3>Asynchronous Load Instructions</h3>
-<p>Starting with <a href="https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#changes-in-ptx-isa-version-7-0">PTX Version 7.0</a> Cuda provides instructions to copy data asynchronously from global to shared memory. The copy bypasses local registers and stores data directly to the shared memory (L1 cache). As identified above, asynchronous loading is one of the differences between the simple GEMM code and the Cublas version.<br>
+<p>Starting with <a href="https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#changes-in-ptx-isa-version-7-0">PTX Version 7.0</a> CUDA provides instructions to copy data asynchronously from global to shared memory. The copy bypasses local registers and stores data directly to the shared memory (L1 cache). As identified above, asynchronous loading is one of the differences between the simple GEMM code and the cuBLAS version.<br>
 Two changes are necessary for asynchronous loading. First, the new load function is:</p>
 <div class="highlight"><pre><span></span><code><span class="w">    </span><span class="n">__device__</span><span class="w"> </span><span class="kt">void</span><span class="w"> </span><span class="n">load</span><span class="p">(</span><span class="kt">size_t</span><span class="w"> </span><span class="n">counter</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
 <span class="w">        </span><span class="k">const</span><span class="w"> </span><span class="kt">size_t</span><span class="w"> </span><span class="n">global_idx</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">offset_</span><span class="p">.</span><span class="n">row</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">ld_</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">offset_</span><span class="p">.</span><span class="n">col</span><span class="p">;</span>
@@ -148,7 +150,7 @@ Two changes are necessary for asynchronous loading. First, the new load function
 <span class="w">        </span><span class="s2">&quot;l&quot;</span><span class="o">(</span>src<span class="o">)</span>,<span class="w"> </span><span class="s2">&quot;n&quot;</span><span class="o">(</span>Bytes<span class="o">))</span>
 </code></pre></div>
 
-<p>The compiler converts it into the same SASS instruction as can be seen in the CuBLAS code:</p>
+<p>The compiler converts it into the same SASS instruction as can be seen in the cuBLAS code:</p>
 <div class="highlight"><pre><span></span><code>LDGSTS.E.BYPASS.LTC128B.128<span class="w"> </span><span class="o">[</span>R11<span class="o">]</span>,<span class="w"> </span><span class="o">[</span>R2.64<span class="o">]</span>
 </code></pre></div>
 
@@ -162,7 +164,7 @@ Two changes are necessary for asynchronous loading. First, the new load function
 <span class="w">    </span>DEPBAR.LE<span class="w"> </span>SB0,<span class="w"> </span>0x0
 </code></pre></div>
 
-<p>These two SASS instructions are found in the CuBLAS code too. The slight difference between the two is covered in the next section. Visualizing the new load instruction <code>LDGSTS.E.BYPASS.LTC128B.128</code> is very instructive:</p>
+<p>These two SASS instructions are found in the cuBLAS code too. The slight difference between the two is covered in the next section. Visualizing the new load instruction <code>LDGSTS.E.BYPASS.LTC128B.128</code> is very instructive:</p>
 <p><img alt="Async" src="https://fabianschuetze.github.io/images/async.png"></p>
 <p>The data goes directly from the L2 Cache through the shared memory (a portion of the L1 cache).</p>
 <h3>Overlapping Memory Loads with Computation</h3>
@@ -210,11 +212,11 @@ Two changes are necessary for asynchronous loading. First, the new load function
 <p>The computation starts by loading data from global to shared memory. The class loading data from shared to global memory manages two buffers. Data gets read from one buffer and stored in the other buffer. The main loop begins by initiating a global memory load. The matrix elements are then computed. Afterward, the threads block until the previously fetched memory has been loaded. In the loop's epilogue, the last outstanding matrix computation is conducted.</p>
 <p>This kernel attains 73 TFLOPS, a 20 percent increase to the first kernel.</p>
 <h2>4. Improvement II: DOUBLE BUFFERING</h2>
-<p>The code above already improves the throughput of the kernel. However, it is still below the CuBLAS version, and the assembly instructions do not match. In particular, the memory barrier in the code above is <code>DEPBAR.LE SB0, 0x0</code>, but the memory barrier in the CuBLAS code is <code>DEPBAR.LE SB0, 0x1</code>. The SASS instructions are undocumented, but one can assume that LE stands for less or equal. Furthermore, the PTX docs for the <a href="https://docs.nvidia.com/cuda/parallel-thread-execution/index.html?highlight=async#data-movement-and-conversion-instructions-cp-async-wait-group-cp-async-wait-all">memory barrier</a> state that the PTX instruction <code>cp.async.wait_group N</code> is:</p>
+<p>The code above already improves the throughput of the kernel. However, it is still below the cuBLAS version, and the assembly instructions do not match. In particular, the memory barrier in the code above is <code>DEPBAR.LE SB0, 0x0</code>, but the memory barrier in the cuBLAS code is <code>DEPBAR.LE SB0, 0x1</code>. The SASS instructions are undocumented, but one can assume that LE stands for less or equal. Furthermore, the PTX docs for the <a href="https://docs.nvidia.com/cuda/parallel-thread-execution/index.html?highlight=async#data-movement-and-conversion-instructions-cp-async-wait-group-cp-async-wait-all">memory barrier</a> state that the PTX instruction <code>cp.async.wait_group N</code> is:</p>
 <blockquote>
 <p>cp.async.wait_group instruction will cause the executing thread to wait till only N or fewer of the most recent cp.async-groups are pending and all the prior cp.async-groups committed by the executing threads are complete.</p>
 </blockquote>
-<p>Besides the difference in instructions, the kernel above also regularly stalled because data was unavailable. The warps stalled for almost two cycles for each issued instruction because data was unavailable (long scoreboard stall). To avoid such stalls and replicate the SASS code for the CuBLAS kernel, the kernel below does “double buffering”: Always have two shared memory operations in flight and await only the oldest one. Register loads are buffered too. The kernel has one register file loaded, loads the next one, and computes the matrix operation on the previous register file. The code for the kernel is as follows:</p>
+<p>Besides the difference in instructions, the kernel above also regularly stalled because data was unavailable. The warps stalled for almost two cycles for each issued instruction because data was unavailable (long scoreboard stall). To avoid such stalls and replicate the SASS code for the cuBLAS kernel, the kernel below does “double buffering”: Always have two shared memory operations in flight and await only the oldest one. Register loads are buffered too. The kernel has one register file loaded, loads the next one, and computes the matrix operation on the previous register file. The code for the kernel is as follows:</p>
 <div class="highlight"><pre><span></span><code><span class="w">    </span><span class="n">LoaderA</span><span class="p">.</span><span class="n">load</span><span class="p">(</span><span class="mi">0</span><span class="p">);</span>
 <span class="w">    </span><span class="n">LoaderB</span><span class="p">.</span><span class="n">load</span><span class="p">(</span><span class="mi">0</span><span class="p">);</span>
 <span class="w">    </span><span class="n">LoaderA</span><span class="p">.</span><span class="n">next</span><span class="p">(</span><span class="n">Threadblock</span><span class="o">::</span><span class="n">kK</span><span class="p">);</span>
@@ -260,8 +262,15 @@ Two changes are necessary for asynchronous loading. First, the new load function
 <span class="w">    </span><span class="p">}</span>
 </code></pre></div>
 
-<p>The prologue to the main loop begins by issuing two shared memory loads. The threads block until only the first one is completed, while the second one remains in flight. Then, the first register file is loaded. The main loop begins by loading a further fragment of shared memory, and the tensor cores operate on the previous fragment. When all local registers are filled, the shared memory of the first block has been exhausted. No computation can be overlaid over the memory copies anymore. Another load is issued, and the warps wait until the previous load is completed.</p>
-<p>With these advances, the throughput of the kernel advances to 89 TFLOPS and reaches within 95% of CuBLAS performance. Further gains can be reaped by writing the matrix C through shared memory back to global memory. The kernel throughput then advances to 91 TFLOPS, 1 TFLOP behind the CuBlas kernel.</p>
+<p>The prologue to the main loop begins by issuing two shared memory loads. The threads block until the first load is completed, while the second one remains in flight. Then, the first register file is loaded. The main loop begins by loading a further fragment of shared memory, and the tensor cores operate on the previous fragment. When all local registers are filled, the shared memory of the first block has been exhausted. No computation can be overlaid over the memory copies anymore. Another load is issued, and the warps wait until the previous load is completed.</p>
+<p>With these advances, the throughput of the kernel advances to 89 TFLOPS and reaches within 95% of cuBLAS performance. Further gains can be reaped by writing the result of the multiplication through shared memory back to global memory. The kernel throughput then advances to 91 TFLOPS, 1 TFLOP behind the cuBLAS kernel.</p>
+<h2>Glossary</h2>
+<p><em>A5000 (GPU)</em>: A GPU produced by Nvidia. The A5000 is based on the Ampere microarchitecture. The article uses specialized instructions introduced with Ampere. The subsequent microarchitecture (Hopper) introduced new instructions to attain maximum performance on these types of GPUs.  </p>
+<p><em>BLAS (and GEMM)</em>: GEMM stands for General Matrix Multiplication. Refers to a group of operations (called Level 3) of the Basic Linear Algebra Subprograms (BLAS) too. A standardized interface to BLAS will become part of C++ 26 (std::linalg) as proposed by P1673. </p>
+<p><em>cuBLAS</em>: Nvidia's variant of the BLAS library. It contains highly optimized and specialized code for all GPU variants and matrix sizes. Its source code is not publicly accessible.</p>
+<p><em>CUDA</em>: An extension of the C language to write programs for Nvidia GPUs. CUDA affords programmers the ability to control the L1 cache of such GPUs. </p>
+<p><em>PTX</em>: PTX (Parallel Thread Execution) describes an idealized virtual machine depicting an archetypical Nvidia GPU and its corresponding instruction set architecture (ISA). Cuda code also compiles to PTX, which gets further translated to (undocumented) SASS code. Programmers can also write PTX code.</p>
+<p><em>SASS</em>: An undocumented assembly language for Nvidia GPUs. It translates to binary microcode that gets executed on an actual target.</p>
 <p>© 2024 Fabian Schuetze</p>
     </div><!-- /.entry-content -->
 
